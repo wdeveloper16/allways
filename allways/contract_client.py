@@ -677,6 +677,20 @@ class AllwaysContractClient:
         v = self._extract_account_id(data)
         return v if v is not None else ''
 
+    def _unwrap_result(self, method: str, data: bytes) -> bytes:
+        """Strip Result<Ok, Err> discriminant and return the Ok payload.
+
+        Raises ContractError(CONTRACT_REJECTED) if the discriminant is Err.
+        """
+        if data[0] != 0x00:
+            if len(data) >= 2:
+                variant = CONTRACT_ERROR_VARIANTS.get(data[1])
+                if variant:
+                    name, description = variant
+                    raise ContractError(ContractErrorKind.CONTRACT_REJECTED, f'{method}: {name} — {description}')
+            raise ContractError(ContractErrorKind.CONTRACT_REJECTED, f'{method}: contract rejected')
+        return data[1:]
+
     def _read_option_swap(self, method: str, args: dict = None, caller=None) -> Optional[Swap]:
         """Read a method that returns Option<SwapData>."""
         self._ensure_initialized()
@@ -696,20 +710,15 @@ class AllwaysContractClient:
         data = self._raw_contract_read(method, args, caller=caller)
         if data is None or len(data) < 1:
             return None
-        # Result discriminant: 0x00 = Ok, 0x01 = Err
-        if data[0] != 0x00:
-            if len(data) >= 2:
-                variant = CONTRACT_ERROR_VARIANTS.get(data[1])
-                if variant:
-                    bt.logging.debug(f'{method}: contract error — {variant[0]}')
+        try:
+            payload = self._unwrap_result(method, data)
+        except ContractError as e:
+            bt.logging.debug(str(e))
             return None
-        if len(data) < 2:
+        if len(payload) < 1 or payload[0] == 0x00:
             return None
-        # Option discriminant
-        if data[1] == 0x00:
-            return None
-        if data[1] == 0x01:
-            return self._decode_swap_data(data, offset=2)
+        if payload[0] == 0x01:
+            return self._decode_swap_data(payload, offset=1)
         return None
 
     def _read_result_u128(self, method: str, args: dict = None, caller=None) -> int:
@@ -718,14 +727,8 @@ class AllwaysContractClient:
         data = self._raw_contract_read(method, args, caller=caller)
         if data is None or len(data) < 1:
             raise ContractError(ContractErrorKind.RPC_FAILURE, f'{method}: no response')
-        if data[0] != 0x00:
-            if len(data) >= 2:
-                variant = CONTRACT_ERROR_VARIANTS.get(data[1])
-                if variant:
-                    name, description = variant
-                    raise ContractError(ContractErrorKind.CONTRACT_REJECTED, f'{method}: {name} — {description}')
-            raise ContractError(ContractErrorKind.CONTRACT_REJECTED, f'{method}: contract rejected')
-        v = self._extract_u128(data[1:])
+        payload = self._unwrap_result(method, data)
+        v = self._extract_u128(payload)
         return v if v is not None else 0
 
     # =========================================================================
