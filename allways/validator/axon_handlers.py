@@ -230,11 +230,8 @@ async def handle_miner_activate(
 # =============================================================================
 
 
-async def blacklist_swap_reserve(
-    validator: 'Validator',
-    synapse: SwapReserveSynapse,
-) -> Tuple[bool, str]:
-    """Pass-through — custom field checks happen in forward handler.
+async def _passthrough_blacklist(validator: 'Validator', synapse) -> Tuple[bool, str]:
+    """Pass-through blacklist — custom field checks happen in the forward handler.
 
     Bittensor's axon middleware constructs the synapse from HTTP headers (default values)
     before calling blacklist. Custom fields (from_address, proof, etc.) are only available
@@ -243,12 +240,23 @@ async def blacklist_swap_reserve(
     return False, 'Passed'
 
 
+async def _flat_priority(validator: 'Validator', synapse) -> float:
+    """Flat priority for user requests."""
+    return 1.0
+
+
+async def blacklist_swap_reserve(
+    validator: 'Validator',
+    synapse: SwapReserveSynapse,
+) -> Tuple[bool, str]:
+    return await _passthrough_blacklist(validator, synapse)
+
+
 async def priority_swap_reserve(
     validator: 'Validator',
     synapse: SwapReserveSynapse,
 ) -> float:
-    """Flat priority for user requests."""
-    return 1.0
+    return await _flat_priority(validator, synapse)
 
 
 async def handle_swap_reserve(
@@ -396,19 +404,14 @@ async def blacklist_swap_confirm(
     validator: 'Validator',
     synapse: SwapConfirmSynapse,
 ) -> Tuple[bool, str]:
-    """Pass-through — custom field checks happen in forward handler.
-
-    See blacklist_swap_reserve docstring for rationale.
-    """
-    return False, 'Passed'
+    return await _passthrough_blacklist(validator, synapse)
 
 
 async def priority_swap_confirm(
     validator: 'Validator',
     synapse: SwapConfirmSynapse,
 ) -> float:
-    """Flat priority for user requests."""
-    return 1.0
+    return await _flat_priority(validator, synapse)
 
 
 async def handle_swap_confirm(
