@@ -501,6 +501,11 @@ class AllwaysContractClient:
 
     _compact_encode_len = staticmethod(compact_encode_len)
 
+    def _extract_u8(self, data: bytes) -> Optional[int]:
+        if not data or len(data) < 1:
+            return None
+        return data[0]
+
     def _extract_u32(self, data: bytes) -> Optional[int]:
         if not data or len(data) < 4:
             return None
@@ -636,6 +641,14 @@ class AllwaysContractClient:
     # =========================================================================
     # Read helpers (typed wrappers over _raw_contract_read)
     # =========================================================================
+
+    def _read_u8(self, method: str, args: dict = None) -> int:
+        self._ensure_initialized()
+        data = self._raw_contract_read(method, args)
+        if data is None:
+            raise ContractError(ContractErrorKind.RPC_FAILURE, f'{method}: no response')
+        v = self._extract_u8(data)
+        return v if v is not None else 0
 
     def _read_u32(self, method: str, args: dict = None) -> int:
         self._ensure_initialized()
@@ -800,11 +813,7 @@ class AllwaysContractClient:
         return self._read_u32('get_miner_deactivation_block', {'miner': hotkey})
 
     def get_consensus_threshold(self) -> int:
-        self._ensure_initialized()
-        data = self._raw_contract_read('get_consensus_threshold')
-        if data is None or len(data) < 1:
-            return 0
-        return data[0]
+        return self._read_u8('get_consensus_threshold')
 
     def get_validator_count(self) -> int:
         return self._read_u32('get_validator_count')
