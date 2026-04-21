@@ -15,9 +15,11 @@ import bittensor as bt
 from Crypto.Hash import keccak
 from substrateinterface import Keypair
 
+from allways.chains import canonical_pair, get_chain
 from allways.classes import MinerPair
 from allways.commitments import read_miner_commitment
 from allways.constants import RESERVATION_COOLDOWN_BLOCKS
+from allways.utils.rate import calculate_to_amount
 from allways.contract_client import AllwaysContractClient, ContractError, is_contract_rejection
 from allways.synapses import MinerActivateSynapse, SwapConfirmSynapse, SwapReserveSynapse
 from allways.utils.scale import encode_bytes, encode_str, encode_u128
@@ -306,16 +308,31 @@ async def handle_swap_reserve(
                 reject_synapse(synapse, 'No valid commitment', ctx)
                 return synapse
 
-            # The requested direction must match one of the commitment's chains
+            # The requested direction must match both chains in the commitment
             # and the miner must quote a non-zero rate for it. This blocks a DoS
             # where a user could lock a miner for the reservation TTL on a
             # direction that would only fail at confirm time.
             if synapse.from_chain not in (commitment.from_chain, commitment.to_chain):
                 reject_synapse(synapse, 'Miner does not support this swap direction', ctx)
                 return synapse
-            reserve_rate, _ = commitment.get_rate_for_direction(synapse.from_chain)
+            if synapse.to_chain not in (commitment.from_chain, commitment.to_chain):
+                reject_synapse(synapse, 'Miner does not support this swap direction', ctx)
+                return synapse
+            reserve_rate, rate_str = commitment.get_rate_for_direction(synapse.from_chain)
             if reserve_rate <= 0:
                 reject_synapse(synapse, 'Miner does not support this swap direction', ctx)
+                return synapse
+
+            canon_from, canon_to = canonical_pair(synapse.from_chain, synapse.to_chain)
+            expected_to = calculate_to_amount(
+                synapse.from_amount,
+                rate_str,
+                synapse.from_chain != canon_from,
+                get_chain(canon_to).decimals,
+                get_chain(canon_from).decimals,
+            )
+            if synapse.to_amount != expected_to:
+                reject_synapse(synapse, f'to_amount mismatch: got {synapse.to_amount}, expected {expected_to}', ctx)
                 return synapse
 
             balance = provider.get_balance(synapse.from_address)
