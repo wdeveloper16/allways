@@ -47,6 +47,42 @@ def to_mainnet_wif(wif: str) -> str:
     return wif
 
 
+def _p2tr_xonly_from_address(address: str) -> Optional[bytes]:
+    """Extract the 32-byte x-only tweaked pubkey from a P2TR (bech32m) address."""
+    try:
+        from embit.bech32 import decode as embit_decode
+
+        for hrp in ('bc', 'tb', 'bcrt'):
+            ver, prog = embit_decode(hrp, address)
+            if ver == 1 and prog is not None and len(prog) == 32:
+                return bytes(prog)
+    except Exception:
+        pass
+    return None
+
+
+def _bip322_p2tr_sighash(message: str, p2tr_script) -> bytes:
+    """Compute the BIP-322 simple sighash for a P2TR scriptpubkey."""
+    from embit.hashes import tagged_hash, double_sha256
+    from embit.script import Script
+    from embit.transaction import Transaction, TransactionInput, TransactionOutput
+
+    msg_hash = tagged_hash('BIP0322-signed-message', message.encode('utf-8'))
+    to_spend = Transaction(version=0, locktime=0, vin=[], vout=[])
+    to_spend.vin.append(
+        TransactionInput(b'\x00' * 32, 0xFFFFFFFF, Script(bytes([0x00, 0x20]) + msg_hash), sequence=0)
+    )
+    to_spend.vout.append(TransactionOutput(0, p2tr_script))
+
+    txid = double_sha256(to_spend.serialize())[::-1]
+
+    to_sign = Transaction(version=0, locktime=0, vin=[], vout=[])
+    to_sign.vin.append(TransactionInput(txid, 0, sequence=0))
+    to_sign.vout.append(TransactionOutput(0, Script(bytes([0x6A]))))  # OP_RETURN
+
+    return to_sign.sighash_taproot(0, [p2tr_script], [0])
+
+
 def to_mainnet_address(address: str) -> str:
     """Convert a testnet/regtest address to mainnet equivalent for verification."""
     if address.startswith('bcrt1') or address.startswith('tb1'):
@@ -312,13 +348,17 @@ class BitcoinProvider(ChainProvider):
         return self.validate_address_local(address)
 
     def validate_address_local(self, address: str) -> bool:
-        """Validate BTC address format without RPC (bech32/base58 decode)."""
+        """Validate BTC address format without RPC (bech32/bech32m/base58 decode)."""
         if not address or not isinstance(address, str):
             return False
         try:
             if address.lower().startswith(('bc1', 'tb1', 'bcrt1')):
+                # bech32 for P2WPKH (bc1q/tb1q/bcrt1q)
                 hrp, data = bech32.bech32_decode(address)
-                return data is not None
+                if data is not None:
+                    return True
+                # bech32m for P2TR (bc1p/tb1p/bcrt1p)
+                return _p2tr_xonly_from_address(address) is not None
             decoded = base58.b58decode_check(address)
             return len(decoded) == 21 and decoded[0] in (0x00, 0x05, 0x6F, 0xC4)
         except Exception:
@@ -344,13 +384,10 @@ class BitcoinProvider(ChainProvider):
     def sign_from_proof(self, address: str, message: str, key: Optional[Any] = None) -> str:
         """Sign a message proving ownership of a Bitcoin address.
 
-        Supports P2PKH, P2WPKH, and P2SH-P2WPKH addresses via BIP-137.
+        Supports P2PKH, P2WPKH, and P2SH-P2WPKH via BIP-137, and P2TR via BIP-322.
         key: WIF private key string. If None, attempts dumpprivkey RPC.
         """
         addr_type = detect_address_type(address)
-        if addr_type == ADDR_TYPE_P2TR:
-            bt.logging.error('Taproot (P2TR) addresses are not yet supported for message signing')
-            return ''
         if addr_type == 'unknown':
             bt.logging.error(f'Unknown Bitcoin address type: {address}')
             return ''
@@ -362,6 +399,9 @@ class BitcoinProvider(ChainProvider):
             )
             return ''
 
+        if addr_type == ADDR_TYPE_P2TR:
+            return self._sign_p2tr(address, message, wif)
+
         try:
             _, _, signature = sign_message(to_mainnet_wif(wif), addr_type, message, deterministic=True)
             return signature
@@ -369,16 +409,47 @@ class BitcoinProvider(ChainProvider):
             bt.logging.error(f'BTC sign_from_proof failed: {e}')
             return ''
 
+    def _sign_p2tr(self, address: str, message: str, wif: str) -> str:
+        """BIP-322 simple signing for a P2TR (Taproot) address."""
+        try:
+            import io
+
+            from embit.ec import PrivateKey as EmbitPrivateKey
+            from embit.script import Script
+
+            xonly = _p2tr_xonly_from_address(address)
+            if xonly is None:
+                bt.logging.error(f'Cannot decode P2TR address: {address}')
+                return ''
+
+            privkey = EmbitPrivateKey.from_wif(to_mainnet_wif(wif))
+            tweaked = privkey.taproot_tweak(b'')
+            if tweaked.xonly() != xonly:
+                bt.logging.error(f'WIF key does not match P2TR address {address} — key mismatch')
+                return ''
+
+            p2tr_script = Script(bytes([0x51, 0x20]) + xonly)
+            sighash = _bip322_p2tr_sighash(message, p2tr_script)
+            sig = tweaked.schnorr_sign(sighash)
+
+            buf = io.BytesIO()
+            sig.write_to(buf)
+            import base64
+
+            return base64.b64encode(bytes([0x01, 0x40]) + buf.getvalue()).decode()
+        except Exception as e:
+            bt.logging.error(f'BTC P2TR sign_from_proof failed: {e}')
+            return ''
+
     def verify_from_proof(self, address: str, message: str, signature: str) -> bool:
         """Verify a signed message from a Bitcoin address.
 
-        Supports P2PKH, P2WPKH, and P2SH-P2WPKH addresses via BIP-137.
+        Supports P2PKH, P2WPKH, and P2SH-P2WPKH via BIP-137, and P2TR via BIP-322.
         No RPC dependency — pure cryptographic verification.
         """
         addr_type = detect_address_type(address)
         if addr_type == ADDR_TYPE_P2TR:
-            bt.logging.warning('Taproot (P2TR) addresses are not yet supported for message verification')
-            return False
+            return self._verify_p2tr(address, message, signature)
         if addr_type == 'unknown':
             bt.logging.error(f'Unknown Bitcoin address type for verification: {address}')
             return False
@@ -390,13 +461,41 @@ class BitcoinProvider(ChainProvider):
             bt.logging.error(f'BTC verify_from_proof failed: {e}')
             return False
 
+    def _verify_p2tr(self, address: str, message: str, signature: str) -> bool:
+        """BIP-322 simple verification for a P2TR (Taproot) address."""
+        try:
+            import base64
+
+            from embit.ec import PublicKey, SchnorrSig
+            from embit.script import Script
+
+            xonly = _p2tr_xonly_from_address(address)
+            if xonly is None:
+                bt.logging.warning(f'Cannot decode P2TR address for verification: {address}')
+                return False
+
+            raw = base64.b64decode(signature)
+            # BIP-322 simple witness: 0x01 (1 stack item) + 0x40 (64-byte push) + 64-byte sig
+            if len(raw) < 66 or raw[0] != 0x01 or raw[1] != 0x40:
+                return False
+            schnorr_sig = SchnorrSig.parse(raw[2:66])
+
+            p2tr_script = Script(bytes([0x51, 0x20]) + xonly)
+            sighash = _bip322_p2tr_sighash(message, p2tr_script)
+
+            tweaked_pub = PublicKey.from_xonly(xonly)
+            return tweaked_pub.schnorr_verify(schnorr_sig, sighash)
+        except Exception as e:
+            bt.logging.error(f'BTC P2TR verify_from_proof failed: {e}')
+            return False
+
     def send_amount_lightweight(
         self, to_address: str, amount: int, from_address: Optional[str] = None
     ) -> Optional[Tuple[str, int]]:
         """Send BTC via embit + Blockstream API (no full node required). Amount in satoshis.
 
-        Uses BTC_PRIVATE_KEY env var (WIF format). Supports all address types:
-        P2WPKH (bc1q...), P2SH-P2WPKH (3...), and P2PKH (1...).
+        Uses BTC_PRIVATE_KEY env var (WIF format). Supports P2WPKH (bc1q...),
+        P2SH-P2WPKH (3...), P2PKH (1...), and P2TR (bc1p...).
 
         If from_address is provided (e.g. the miner's committed address), the
         matching address type is derived directly from the WIF key. Otherwise,
@@ -408,7 +507,7 @@ class BitcoinProvider(ChainProvider):
             from embit.ec import PrivateKey as EmbitPrivateKey
             from embit.networks import NETWORKS
             from embit.psbt import PSBT
-            from embit.script import Witness, address_to_scriptpubkey, p2pkh, p2sh, p2wpkh
+            from embit.script import Witness, address_to_scriptpubkey, p2pkh, p2sh, p2tr as embit_p2tr, p2wpkh
             from embit.transaction import Transaction, TransactionInput, TransactionOutput
         except ImportError:
             bt.logging.error('embit not installed (pip install embit)')
@@ -420,15 +519,19 @@ class BitcoinProvider(ChainProvider):
             return None
 
         try:
+            import io
+
             network = NETWORKS['test'] if self.network == 'testnet' else NETWORKS['main']
             privkey = EmbitPrivateKey.from_wif(wif)
             pubkey = privkey.get_public_key()
             segwit_script = p2wpkh(pubkey)
+            taproot_script = embit_p2tr(pubkey)
 
             type_to_script = {
                 ADDR_TYPE_P2WPKH: ('p2wpkh', segwit_script, segwit_script.address(network)),
                 ADDR_TYPE_P2SH_P2WPKH: ('p2sh-p2wpkh', p2sh(segwit_script), p2sh(segwit_script).address(network)),
                 ADDR_TYPE_P2PKH: ('p2pkh', p2pkh(pubkey), p2pkh(pubkey).address(network)),
+                ADDR_TYPE_P2TR: ('p2tr', taproot_script, taproot_script.address(network)),
             }
 
             result = self.resolve_sender_utxos(from_address, type_to_script)
@@ -436,10 +539,13 @@ class BitcoinProvider(ChainProvider):
                 return None
             my_script, my_address, utxos, addr_type = result
 
+            is_taproot = addr_type == 'p2tr'
             is_segwit = addr_type in ('p2wpkh', 'p2sh-p2wpkh')
+            # P2TR: 58 vbytes/input (key-path spend)  P2WPKH: 68  P2PKH: 148
+            input_vsize = 58 if is_taproot else (68 if is_segwit else 148)
             bt.logging.info(f'Sending from {addr_type} address: {my_address}')
 
-            coin_selection = self.select_utxos(utxos, amount, is_segwit)
+            coin_selection = self.select_utxos(utxos, amount, input_vsize)
             if coin_selection is None:
                 return None
             selected, total_in, fee = coin_selection
@@ -455,45 +561,58 @@ class BitcoinProvider(ChainProvider):
             if change > 546:  # dust threshold
                 tx.vout.append(TransactionOutput(change, my_script))
 
-            # Sign transaction
-            psbt = PSBT(tx)
-            if is_segwit:
-                for i, utxo in enumerate(selected):
-                    psbt.inputs[i].witness_utxo = TransactionOutput(utxo['value'], my_script)
-                    if addr_type == 'p2sh-p2wpkh':
-                        # Nested segwit: need redeem script
-                        psbt.inputs[i].redeem_script = segwit_script
+            if is_taproot:
+                # P2TR key-path spend: direct Schnorr signing, no PSBT needed
+                tweaked = privkey.taproot_tweak(b'')
+                values = [u['value'] for u in selected]
+                scripts = [my_script] * len(selected)
+                for i in range(len(selected)):
+                    sighash = tx.sighash_taproot(i, scripts, values)
+                    sig = tweaked.schnorr_sign(sighash)
+                    buf = io.BytesIO()
+                    sig.write_to(buf)
+                    tx.vin[i].witness = Witness([buf.getvalue()])
+                final_tx = tx
             else:
-                # Legacy P2PKH: need full previous transaction for signing
-                for i, utxo in enumerate(selected):
-                    tx_url = f'{self.blockstream_api_url()}/tx/{utxo["txid"]}/hex'
-                    tx_resp = requests.get(tx_url, timeout=15)
-                    tx_resp.raise_for_status()
-                    prev_tx = Transaction.from_string(tx_resp.text.strip())
-                    psbt.inputs[i].non_witness_utxo = prev_tx
-
-            num_sigs = psbt.sign_with(privkey)
-            if num_sigs != len(selected):
-                bt.logging.error(f'Expected {len(selected)} sigs, got {num_sigs}')
-                return None
-
-            # Finalize: extract tx (psbt.tx returns a copy each time) and attach signatures
-            final_tx = psbt.tx
-            for i, inp in enumerate(psbt.inputs):
+                # Sign via PSBT (P2WPKH, P2SH-P2WPKH, P2PKH)
+                psbt = PSBT(tx)
                 if is_segwit:
-                    for pub, sig in inp.partial_sigs.items():
-                        final_tx.vin[i].witness = Witness([sig, pub.sec()])
+                    for i, utxo in enumerate(selected):
+                        psbt.inputs[i].witness_utxo = TransactionOutput(utxo['value'], my_script)
                         if addr_type == 'p2sh-p2wpkh':
-                            final_tx.vin[i].script_sig = segwit_script.serialize()
+                            # Nested segwit: need redeem script
+                            psbt.inputs[i].redeem_script = segwit_script
                 else:
-                    from embit.script import Script
+                    # Legacy P2PKH: need full previous transaction for signing
+                    for i, utxo in enumerate(selected):
+                        tx_url = f'{self.blockstream_api_url()}/tx/{utxo["txid"]}/hex'
+                        tx_resp = requests.get(tx_url, timeout=15)
+                        tx_resp.raise_for_status()
+                        prev_tx = Transaction.from_string(tx_resp.text.strip())
+                        psbt.inputs[i].non_witness_utxo = prev_tx
 
-                    for pub, sig in inp.partial_sigs.items():
-                        sig_bytes = sig if isinstance(sig, bytes) else bytes(sig)
-                        pub_bytes = pub.sec()
-                        final_tx.vin[i].script_sig = Script(
-                            bytes([len(sig_bytes)]) + sig_bytes + bytes([len(pub_bytes)]) + pub_bytes
-                        )
+                num_sigs = psbt.sign_with(privkey)
+                if num_sigs != len(selected):
+                    bt.logging.error(f'Expected {len(selected)} sigs, got {num_sigs}')
+                    return None
+
+                # Finalize: extract tx (psbt.tx returns a copy each time) and attach signatures
+                final_tx = psbt.tx
+                for i, inp in enumerate(psbt.inputs):
+                    if is_segwit:
+                        for pub, sig in inp.partial_sigs.items():
+                            final_tx.vin[i].witness = Witness([sig, pub.sec()])
+                            if addr_type == 'p2sh-p2wpkh':
+                                final_tx.vin[i].script_sig = segwit_script.serialize()
+                    else:
+                        from embit.script import Script
+
+                        for pub, sig in inp.partial_sigs.items():
+                            sig_bytes = sig if isinstance(sig, bytes) else bytes(sig)
+                            pub_bytes = pub.sec()
+                            final_tx.vin[i].script_sig = Script(
+                                bytes([len(sig_bytes)]) + sig_bytes + bytes([len(pub_bytes)]) + pub_bytes
+                            )
 
             raw_tx = final_tx.serialize().hex()
             tx_hash = self.broadcast_tx(raw_tx)
@@ -545,10 +664,12 @@ class BitcoinProvider(ChainProvider):
         bt.logging.error('No UTXOs found for any address type')
         return None
 
-    def select_utxos(self, utxos, amount: int, is_segwit: bool):
-        """Greedy UTXO selection. Returns (selected, total_in, fee) or None."""
+    def select_utxos(self, utxos, amount: int, input_vsize: int):
+        """Greedy UTXO selection. Returns (selected, total_in, fee) or None.
+
+        input_vsize: per-input virtual size in vbytes (P2WPKH=68, P2TR=58, P2PKH=148).
+        """
         fee_rate = self.estimate_fee_rate()
-        input_vsize = 68 if is_segwit else 148
         selected = []
         total_in = 0
         for utxo in sorted(utxos, key=lambda u: u['value'], reverse=True):
